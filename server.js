@@ -9,8 +9,14 @@ const DAILY_LIMIT = Number(process.env.DAILY_LIMIT) || 20;      // 관리자 외
 const VERIFY_BONUS = 30;                                         // 이메일 인증 시 추가 한도
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';            // nginx / Render 등 프록시 뒤에서만 1
 const BASE = process.env.GEMINI_BASE || 'https://generativelanguage.googleapis.com';
-const DATA = path.join(__dirname, 'data'), ROOMS = path.join(DATA, 'rooms');
+// 데이터 경로: Render 영구 디스크 쓰면 DATA_DIR 환경변수로 지정 (예: /var/data)
+// 지정 없으면 server.js 옆 data/ 사용 — 재배포 시 휘발성 디스크면 계정 전부 초기화됨
+const DATA = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(__dirname, 'data');
+const ROOMS = path.join(DATA, 'rooms');
 fs.mkdirSync(ROOMS, { recursive: true });
+console.log('[data] 저장 경로:', DATA);
 
 // ---------- 저장소 (메모리 + 파일) ----------
 const rd = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return d; } };
@@ -73,10 +79,11 @@ const limitOf = (a) => {
   return DAILY_LIMIT + bonus;
 };
 const fails = {};
-const readBody = async (req, res) => {
+const readBody = async (req, res, opts) => {
   const raw = await body(req);
   const clean = block.sanitizeObject(raw);
-  if (block.guard(req, res, clean)) return null;
+  // opts.types 로 검사 범위 조절 가능 (채팅 본문은 코딩 질문 허용)
+  if (block.guard(req, res, clean, opts || {})) return null;
   return clean;
 };
 
@@ -305,7 +312,8 @@ http.createServer(async (req, res) => {
       if (u && u.banned) return fail(res, 403, '차단된 계정입니다.');
       const used = usedOf(a, req), lim = limitOf(a), H = n => ({ 'X-Used': String(n), 'X-Limit': String(lim === Infinity ? 0 : lim) });
       if (!a.admin && used >= lim) return fail(res, 429, `오늘 질문 한도(${lim}회)를 모두 사용했습니다. 내일 다시 이용해 주세요.`, H(used));
-      const _b = await readBody(req, res); if (!_b) return;
+      // 채팅 본문은 SQL/XSS 키워드가 정상 질문일 수 있음 → 프로토타입 오염·크기만 검사
+      const _b = await readBody(req, res, { types: ['proto'] }); if (!_b) return;
       const { model, contents, temperature, noThink } = _b;
       if (!/^[\w.\-]+$/.test(model || '') || !Array.isArray(contents) || !contents.length || contents.length > 60) return fail(res, 400, '잘못된 요청입니다.');
       const gen = { temperature: Math.min(2, Math.max(0, Number(temperature) || 0.7)) };
