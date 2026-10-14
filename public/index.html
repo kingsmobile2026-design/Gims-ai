@@ -1033,7 +1033,6 @@ button:disabled{opacity:.45;cursor:not-allowed}
     try {
       const qs = new URLSearchParams({ offset: String(adminOffset), limit: '100' });
       if (adminQ) qs.set('q', adminQ);
-      else qs.set('seed', adminSeed);
       const d = await api('GET', '/api/admin/users?' + qs);
       adminTotal = d.total || 0;
       const list = d.users || [];
@@ -1045,7 +1044,8 @@ button:disabled{opacity:.45;cursor:not-allowed}
       const shown = Math.min(adminOffset + list.length, adminTotal);
       $('adminMeta').textContent = adminQ
         ? '검색 결과 ' + adminTotal + '명 · ' + shown + '명 표시'
-        : '전체 ' + adminTotal + '명 · ' + shown + '명 표시 (랜덤 순서)';
+        : '전체 ' + adminTotal + '명 · ' + shown + '명 표시';
+      // 100명 초과일 때만 더보기, 이하이면 전부 표시됨
       $('adminMore').style.display = shown < adminTotal ? '' : 'none';
     } catch (e) {
       $('adminMeta').textContent = '오류: ' + e.message;
