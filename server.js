@@ -56,7 +56,9 @@ const auth = req => {
   // 로그인한 사용자 확인
   const t = cookie(req).sid, s = t && sess[sha(t)];
   if (s && s.exp > Date.now()) {
-    const isAdminUser = s.user === ADMIN_USER || (users[s.user] && users[s.user].isAdmin);
+    const u = users[s.user];
+    if (u && u.banned) return null; // 밴된 사용자 세션 무효
+    const isAdminUser = s.user === ADMIN_USER || (u && u.isAdmin);
     return { user: s.user, admin: !!isAdminUser };
   }
   return null;
@@ -65,6 +67,7 @@ const usedOf = (a, req) => a.admin ? 0 : Math.max(cnt('u:' + a.user), cnt('ip:' 
 const limitOf = (a) => {
   if (a.admin) return Infinity;
   const u = users[a.user];
+  if (u && typeof u.dailyLimit === 'number' && u.dailyLimit >= 0) return u.dailyLimit;
   const bonus = (u && u.emailVerified) ? VERIFY_BONUS : 0;
   return DAILY_LIMIT + bonus;
 };
@@ -82,6 +85,7 @@ http.createServer(async (req, res) => {
     if (p === '/api/me' && m === 'GET') {
       if (!a) return send(res, 200, { user: null });
       const u = users[a.user] || {};
+      if (u.banned) return send(res, 200, { user: null });
       const lim = limitOf(a);
       return send(res, 200, {
         user: a.user,
@@ -108,6 +112,7 @@ http.createServer(async (req, res) => {
       } else {
         const u = users[name], ok = u && crypto.timingSafeEqual(Buffer.from(hashPw(password, u.salt), 'hex'), Buffer.from(u.hash, 'hex'));
         if (!ok) { f.n++; return fail(res, 401, '아이디 또는 비밀번호가 올바르지 않습니다.'); }
+        if (u.banned) return fail(res, 403, '차단된 계정입니다. 관리자에게 문의하세요.');
       }
       const tok = crypto.randomBytes(32).toString('hex');
       for (const k of Object.keys(sess)) if (sess[k].exp < Date.now()) delete sess[k];
@@ -184,6 +189,76 @@ http.createServer(async (req, res) => {
       if (m === 'DELETE') { cfg.apiKey = ''; wr(F.cfg, cfg); return send(res, 200, { ok: true }); }
     }
 
+    // ----- 관리자: 사용자 목록 / 한도·밴 제어 -----
+    if (p === '/api/admin/users' && m === 'GET') {
+      if (!a.admin) return fail(res, 403, '관리자만 접근할 수 있습니다.');
+      const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
+      const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
+      const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get('limit') || '100', 10) || 100));
+      const seed = url.searchParams.get('seed') || '';
+      let list = Object.keys(users)
+        .filter(name => name !== ADMIN_USER && !users[name].isAdmin)
+        .map(name => {
+          const u = users[name];
+          const custom = typeof u.dailyLimit === 'number' && u.dailyLimit >= 0;
+          const base = custom ? u.dailyLimit : (DAILY_LIMIT + (u.emailVerified ? VERIFY_BONUS : 0));
+          return {
+            username: name,
+            email: u.email || '',
+            emailVerified: !!u.emailVerified,
+            banned: !!u.banned,
+            dailyLimit: custom ? u.dailyLimit : null,
+            effectiveLimit: base,
+            used: cnt('u:' + name)
+          };
+        });
+      if (q) {
+        list = list.filter(u => u.username.includes(q) || (u.email && u.email.includes(q)));
+      }
+      // 아이디 순 정렬 — 전체 사용자 목록 (100명씩 페이지)
+      list.sort((a, b) => a.username.localeCompare(b.username, 'ko'));
+      const total = list.length;
+      const page = list.slice(offset, offset + limit);
+      return send(res, 200, { total, offset, limit, users: page });
+    }
+    if (p === '/api/admin/users' && m === 'PUT') {
+      if (!a.admin) return fail(res, 403, '관리자만 접근할 수 있습니다.');
+      const { username, dailyLimit, banned } = await body(req);
+      const name = String(username || '').trim().toLowerCase();
+      if (!name || !users[name]) return fail(res, 404, '사용자를 찾을 수 없습니다.');
+      if (name === ADMIN_USER || users[name].isAdmin) return fail(res, 403, '관리자 계정은 변경할 수 없습니다.');
+      if (dailyLimit !== undefined) {
+        if (dailyLimit === null || dailyLimit === '') {
+          delete users[name].dailyLimit;
+        } else {
+          const n = Number(dailyLimit);
+          if (!Number.isFinite(n) || n < 0 || n > 100000) return fail(res, 400, '한도는 0~100000 사이여야 합니다.');
+          users[name].dailyLimit = Math.floor(n);
+        }
+      }
+      if (banned !== undefined) {
+        users[name].banned = !!banned;
+        if (banned) {
+          for (const k of Object.keys(sess)) {
+            if (sess[k].user === name) delete sess[k];
+          }
+          wr(F.sess, sess);
+        }
+      }
+      wr(F.users, users);
+      const u = users[name];
+      const custom = typeof u.dailyLimit === 'number' && u.dailyLimit >= 0;
+      return send(res, 200, {
+        ok: true,
+        username: name,
+        email: u.email || '',
+        banned: !!u.banned,
+        dailyLimit: custom ? u.dailyLimit : null,
+        effectiveLimit: custom ? u.dailyLimit : (DAILY_LIMIT + (u.emailVerified ? VERIFY_BONUS : 0)),
+        used: cnt('u:' + name)
+      });
+    }
+
     // ----- 계정별 채팅방 (기기 간 공유) -----
     if (p === '/api/rooms') {
       const file = path.join(ROOMS, a.user + '.json'), d = rd(file, { rev: 0, rooms: [], tomb: {} });
@@ -205,6 +280,8 @@ http.createServer(async (req, res) => {
     // ----- 채팅 (모든 기기가 관리자가 등록한 키를 사용) -----
     if (p === '/api/chat' && m === 'POST') {
       if (!cfg.apiKey) return fail(res, 503, '관리자가 아직 API 키를 등록하지 않았습니다.');
+      const u = users[a.user];
+      if (u && u.banned) return fail(res, 403, '차단된 계정입니다.');
       const used = usedOf(a, req), lim = limitOf(a), H = n => ({ 'X-Used': String(n), 'X-Limit': String(lim === Infinity ? 0 : lim) });
       if (!a.admin && used >= lim) return fail(res, 429, `오늘 질문 한도(${lim}회)를 모두 사용했습니다. 내일 다시 이용해 주세요.`, H(used));
       const { model, contents, temperature, noThink } = await body(req);
