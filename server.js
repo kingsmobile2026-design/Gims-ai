@@ -9,13 +9,28 @@ const DAILY_LIMIT = Number(process.env.DAILY_LIMIT) || 20;      // 관리자 외
 const VERIFY_BONUS = 30;                                         // 이메일 인증 시 추가 한도
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';            // nginx / Render 등 프록시 뒤에서만 1
 const BASE = process.env.GEMINI_BASE || 'https://generativelanguage.googleapis.com';
-// 데이터 경로: Render 영구 디스크 쓰면 DATA_DIR 환경변수로 지정 (예: /var/data)
-// 지정 없으면 server.js 옆 data/ 사용 — 재배포 시 휘발성 디스크면 계정 전부 초기화됨
-const DATA = process.env.DATA_DIR
-  ? path.resolve(process.env.DATA_DIR)
-  : path.join(__dirname, 'data');
+// 데이터 경로: DATA_DIR 환경변수 (영구 디스크 마운트 경로) 또는 server.js 옆 data/
+// Free 플랜: /var/data 는 권한 없음 → DATA_DIR 비우거나 앱 디렉터리 하위 사용
+function resolveDataDir() {
+  const candidates = [];
+  if (process.env.DATA_DIR) candidates.push(path.resolve(process.env.DATA_DIR));
+  candidates.push(path.join(__dirname, 'data'));
+  candidates.push(path.join(process.cwd(), 'data'));
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(path.join(dir, 'rooms'), { recursive: true });
+      return dir;
+    } catch (e) {
+      console.warn('[data] 사용 불가:', dir, e.code || e.message);
+    }
+  }
+  // 최후: /tmp (재시작 시 사라짐)
+  const tmp = path.join(require('os').tmpdir(), 'gims-ai-data');
+  fs.mkdirSync(path.join(tmp, 'rooms'), { recursive: true });
+  return tmp;
+}
+const DATA = resolveDataDir();
 const ROOMS = path.join(DATA, 'rooms');
-fs.mkdirSync(ROOMS, { recursive: true });
 console.log('[data] 저장 경로:', DATA);
 
 // ---------- 저장소 (메모리 + 파일) ----------
