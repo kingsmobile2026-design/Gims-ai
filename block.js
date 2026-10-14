@@ -1,108 +1,81 @@
 /**
  * block.js — Gims AI 입력 방어 모듈 (의존성 없음)
- *
- * 차단 대상:
- *  - SQL / NoSQL 인젝션
- *  - XSS (스크립트·이벤트 핸들러)
- *  - 경로 순회 (path traversal)
- *  - 명령어 인젝션
- *  - 프로토타입 오염
- *  - 헤더/CRLF 인젝션
- *  - 과도한 페이로드
- *
- * 사용:
- *   const block = require('./block');
- *   // 요청 본문 검사
- *   const bad = block.scan(JSON.stringify(body));
- *   if (bad) return fail(res, 400, '차단된 입력이 포함되어 있습니다.');
- *   // 또는 미들웨어 스타일
- *   if (block.guard(req, res)) return; // true면 이미 응답 보냄
+ * SQL/NoSQL/XSS/경로순회/명령인젝션/프로토타입오염/CRLF + 레이트리밋
  */
-
 'use strict';
 
-// ---------- 패턴 정의 ----------
 const PATTERNS = {
-  // SQL 인젝션
   sql: [
-    /(\b)(UNION\s+(ALL\s+)?SELECT|SELECT\s+.+\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|DROP\s+(TABLE|DATABASE)|ALTER\s+TABLE|TRUNCATE\s+TABLE|CREATE\s+(TABLE|DATABASE)|EXEC(\s|\(|ute)|EXECUTE\s|xp_cmdshell|sp_executesql)(\b)/i,
+    /(\b)(UNION\s+(ALL\s+)?SELECT|SELECT\s+\S[\s\S]{0,80}?\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|DROP\s+(TABLE|DATABASE)|ALTER\s+TABLE|TRUNCATE\s+TABLE|CREATE\s+(TABLE|DATABASE)|xp_cmdshell|sp_executesql)(\b)/i,
     /('|")\s*(OR|AND)\s*('|")?\s*\d+\s*(=|<|>|LIKE)\s*('|")?\s*\d+/i,
-    /('|")\s*(OR|AND)\s+['"]?\d+['"]?\s*=\s*['"]?\d+/i,
-    /(--|#|\/\*|\*\/)\s*$/m,
+    /('|")\s*(OR|AND)\s+['"]?\w+['"]?\s*=\s*['"]?\w+/i,
     /;\s*(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE|TRUNCATE)\b/i,
-    /\b(INFORMATION_SCHEMA|SYSOBJECTS|SYSCOLUMNS|PG_CATALOG|MYSQL\.)\b/i,
+    /\b(INFORMATION_SCHEMA|SYSOBJECTS|SYSCOLUMNS|PG_CATALOG)\b/i,
     /\b(BENCHMARK|SLEEP|WAITFOR\s+DELAY|PG_SLEEP)\s*\(/i,
     /\bLOAD_FILE\s*\(|INTO\s+(OUT|DUMP)FILE\b/i,
+    // SQL 주석: Accept */* 오탐 방지 — 앞에 공백/세미콜론이 있을 때만
+    /(?:^|[\s;])(--)\s/,
+    /(?:^|[\s;])\/\*[\s\S]*?\*\//,
   ],
-
-  // NoSQL 인젝션 (MongoDB 등)
   nosql: [
     /\$where\b/i,
-    /\$ne\b|\$gt\b|\$gte\b|\$lt\b|\$lte\b|\$in\b|\$nin\b|\$regex\b|\$exists\b|\$or\b|\$and\b|\$not\b|\$nor\b|\$expr\b/i,
-    /\{\s*["']?\$/,
+    /\$(?:ne|gt|gte|lt|lte|in|nin|regex|exists|or|and|not|nor|expr)\b/i,
+    /\{\s*["']\$/,
   ],
-
-  // XSS
   xss: [
     /<\s*script\b/i,
     /<\s*\/\s*script\s*>/i,
     /javascript\s*:/i,
     /vbscript\s*:/i,
-    /on(error|load|click|mouse|focus|blur|submit|change|input|key|touch|drag|drop|scroll|wheel|pointer|animation|transition)\s*=/i,
-    /<\s*(iframe|object|embed|applet|meta|link|base|form|svg|math)\b/i,
+    /\bon(?:error|load|click|mouse\w*|focus|blur|submit|change|input|key\w*|touch\w*|drag\w*|drop|scroll|wheel|pointer\w*|animation\w*|transition\w*)\s*=/i,
+    /<\s*(iframe|object|embed|applet|svg)\b/i,
     /expression\s*\(/i,
-    /url\s*\(\s*['"]?\s*javascript:/i,
     /data\s*:\s*text\/html/i,
     /\bsrcdoc\s*=/i,
   ],
-
-  // 경로 순회
   path: [
     /\.\.[\\/]/,
-    /(?:^|[\\/])(?:etc|windows|system32|proc|sys)[\\/]/i,
     /%2e%2e[\\/]|%252e%252e/i,
     /\0/,
   ],
-
-  // 명령어 인젝션
   cmd: [
-    /[;&|`]\s*(?:ls|cat|id|whoami|uname|curl|wget|nc|ncat|bash|sh|cmd|powershell|rm|chmod|chown|kill)\b/i,
-    /\$\([^)]+\)|`[^`]+`/,
+    /(?:^|[\s;|&])(?:ls|cat|id|whoami|uname|curl|wget|nc|ncat|bash|sh|cmd|powershell|chmod|chown)\s/i,
+    /\$\([^)]{1,80}\)|`[^`]{1,80}`/,
     /\|\s*(?:bash|sh|cmd|powershell)\b/i,
   ],
-
-  // 프로토타입 오염
   proto: [
     /__proto__/i,
-    /constructor\s*[.\[]\s*prototype/i,
-    /\["prototype"\]|\['prototype'\]/,
+    /constructor\s*[.\[]\s*['"]?prototype/i,
   ],
-
-  // 헤더 / CRLF 인젝션
   crlf: [
-    /[\r\n]\s*(?:Set-Cookie|Location|Content-|X-)/i,
-    /%0d%0a|%0a%0d|\\r\\n|\\n\\r/i,
+    /\r\n\s*(?:Set-Cookie|Location|Content-|X-)/i,
+    /%0d%0a|%0a%0d/i,
   ],
 };
 
 const ALL_KEYS = Object.keys(PATTERNS);
 
-// 허용 문자만 남기는 화이트리스트 (아이디·짧은 토큰용)
+// 브라우저가 항상 보내는 헤더는 검사 제외 (오탐 방지)
+const SKIP_HEADERS = new Set([
+  'accept', 'accept-language', 'accept-encoding', 'accept-charset',
+  'user-agent', 'connection', 'content-length', 'content-type',
+  'host', 'origin', 'referer', 'referrer', 'cookie',
+  'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform', 'sec-ch-ua-full-version-list',
+  'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-fetch-user',
+  'cache-control', 'pragma', 'upgrade-insecure-requests',
+  'dnt', 'te', 'priority', 'purpose', 'x-requested-with',
+]);
+
 const SAFE_ID = /^[a-z0-9_가-힣]{1,64}$/i;
 const SAFE_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const SAFE_HEX = /^[a-f0-9]+$/i;
 
-/**
- * 문자열 한 덩어리를 스캔. 탐지되면 { type, pattern } 반환, 아니면 null
- */
 function scan(input, opts = {}) {
   if (input == null) return null;
   const str = typeof input === 'string' ? input : String(input);
   if (!str) return null;
-
   const maxLen = opts.maxLen != null ? opts.maxLen : 2_000_000;
   if (str.length > maxLen) return { type: 'size', pattern: 'payload too large' };
-
   const types = opts.types || ALL_KEYS;
   for (const type of types) {
     const list = PATTERNS[type];
@@ -114,17 +87,11 @@ function scan(input, opts = {}) {
   return null;
 }
 
-/**
- * 객체/배열을 재귀 스캔 (키 이름 + 값)
- * 프로토타입 오염 키는 즉시 차단
- */
 function scanDeep(value, opts = {}, depth = 0) {
   if (depth > (opts.maxDepth || 12)) return { type: 'depth', pattern: 'too deep' };
   if (value == null) return null;
-
   if (typeof value === 'string') return scan(value, opts);
   if (typeof value === 'number' || typeof value === 'boolean') return null;
-
   if (Array.isArray(value)) {
     for (const item of value) {
       const hit = scanDeep(item, opts, depth + 1);
@@ -132,15 +99,20 @@ function scanDeep(value, opts = {}, depth = 0) {
     }
     return null;
   }
-
   if (typeof value === 'object') {
-    // 위험 키
     for (const k of Object.keys(value)) {
       if (k === '__proto__' || k === 'constructor' || k === 'prototype') {
         return { type: 'proto', pattern: k };
       }
       const keyHit = scan(k, { ...opts, types: ['sql', 'nosql', 'proto', 'crlf'] });
       if (keyHit) return keyHit;
+      // 비밀번호 필드는 XSS/cmd 검사 제외 (특수문자 허용)
+      const lower = k.toLowerCase();
+      if (lower === 'password' || lower === 'pass' || lower === 'pwd') {
+        const v = value[k];
+        if (typeof v === 'string' && v.length > 200) return { type: 'size', pattern: 'password too long' };
+        continue;
+      }
       const valHit = scanDeep(value[k], opts, depth + 1);
       if (valHit) return valHit;
     }
@@ -148,9 +120,6 @@ function scanDeep(value, opts = {}, depth = 0) {
   return null;
 }
 
-/**
- * HTML 이스케이프 (출력 시 XSS 완화)
- */
 function escapeHtml(s) {
   return String(s)
     .replace(/&/g, '&amp;')
@@ -160,9 +129,6 @@ function escapeHtml(s) {
     .replace(/'/g, '&#39;');
 }
 
-/**
- * 경로 정규화 + 순회 차단. base 밖이면 null
- */
 function safePath(baseDir, userPath) {
   const path = require('path');
   if (userPath == null || typeof userPath !== 'string') return null;
@@ -173,9 +139,6 @@ function safePath(baseDir, userPath) {
   return resolved;
 }
 
-/**
- * 아이디 / 이메일 / 단순 토큰 검증
- */
 function isSafeId(s) {
   return typeof s === 'string' && SAFE_ID.test(s);
 }
@@ -186,9 +149,6 @@ function isSafeHex(s, min = 1, max = 128) {
   return typeof s === 'string' && s.length >= min && s.length <= max && SAFE_HEX.test(s);
 }
 
-/**
- * 위험 키 제거한 얕은/깊은 복사 (프로토타입 오염 방지)
- */
 function sanitizeObject(input, depth = 0) {
   if (input == null || typeof input !== 'object') return input;
   if (depth > 12) return null;
@@ -201,18 +161,14 @@ function sanitizeObject(input, depth = 0) {
   return out;
 }
 
-/**
- * HTTP 요청 가드. 위험하면 400 JSON 응답 후 true 반환.
- * server.js 안에서:
- *   if (block.guard(req, res, bodyObj)) return;
- */
 function guard(req, res, body, opts = {}) {
   const targets = [];
   if (req.url) targets.push(req.url);
   if (req.headers) {
     for (const [k, v] of Object.entries(req.headers)) {
-      if (typeof v === 'string') targets.push(k, v);
-      else if (Array.isArray(v)) targets.push(k, ...v);
+      if (SKIP_HEADERS.has(String(k).toLowerCase())) continue;
+      if (typeof v === 'string') targets.push(v);
+      else if (Array.isArray(v)) for (const x of v) targets.push(x);
     }
   }
   if (body !== undefined) {
@@ -234,27 +190,23 @@ function guard(req, res, body, opts = {}) {
 
 function _reject(res, hit) {
   if (res.headersSent) return;
-  const payload = JSON.stringify({
-    error: {
-      message: '차단된 입력이 포함되어 있습니다.',
-      code: 'BLOCKED',
-      type: hit.type,
-    },
-  });
   res.writeHead(400, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
   });
-  res.end(payload);
+  res.end(JSON.stringify({
+    error: {
+      message: '차단된 입력이 포함되어 있습니다.',
+      code: 'BLOCKED',
+      type: hit.type,
+    },
+  }));
   if (typeof console !== 'undefined' && console.warn) {
-    console.warn('[block] rejected', hit.type, hit.pattern && hit.pattern.slice(0, 80));
+    console.warn('[block] rejected', hit.type, hit.pattern && String(hit.pattern).slice(0, 80));
   }
 }
 
-/**
- * 보안 응답 헤더 세트
- */
 function securityHeaders(res) {
   const h = {
     'X-Content-Type-Options': 'nosniff',
@@ -266,13 +218,10 @@ function securityHeaders(res) {
       "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' https://cdn.jsdelivr.net; img-src 'self' data: blob:; connect-src 'self'; frame-src 'self'; base-uri 'self'; form-action 'self'",
   };
   for (const [k, v] of Object.entries(h)) {
-    if (!res.headersSent) res.setHeader(k, v);
+    if (!res.headersSent) try { res.setHeader(k, v); } catch (_) {}
   }
 }
 
-/**
- * IP별 간단 레이트 리밋 (메모리). 반환: 초과면 true
- */
 const _buckets = new Map();
 function rateLimit(ip, { windowMs = 60_000, max = 120 } = {}) {
   const now = Date.now();
@@ -291,16 +240,7 @@ function rateLimit(ip, { windowMs = 60_000, max = 120 } = {}) {
 }
 
 module.exports = {
-  scan,
-  scanDeep,
-  escapeHtml,
-  safePath,
-  isSafeId,
-  isSafeEmail,
-  isSafeHex,
-  sanitizeObject,
-  guard,
-  securityHeaders,
-  rateLimit,
-  PATTERNS,
+  scan, scanDeep, escapeHtml, safePath,
+  isSafeId, isSafeEmail, isSafeHex,
+  sanitizeObject, guard, securityHeaders, rateLimit, PATTERNS,
 };
