@@ -1,6 +1,7 @@
 // Gims AI 서버 — 의존성 없음 (Node 18+).  실행: node server.js
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { Readable } = require('stream');
+const block = require('./block');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_IPS = (process.env.ADMIN_IPS || '211.233.75.204').split(',').map(s => s.trim()).filter(Boolean); // 관리자(화이트리스트) IP
@@ -72,14 +73,28 @@ const limitOf = (a) => {
   return DAILY_LIMIT + bonus;
 };
 const fails = {};
+const readBody = async (req, res) => {
+  const raw = await body(req);
+  const clean = block.sanitizeObject(raw);
+  if (block.guard(req, res, clean)) return null;
+  return clean;
+};
+
 
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x'), p = url.pathname, m = req.method;
   try {
+    block.securityHeaders(res);
+    const clientIp = ip(req);
+    if (block.rateLimit(clientIp, { windowMs: 60_000, max: 180 })) {
+      return fail(res, 429, '요청이 너무 많습니다. 잠시 후 다시 시도하세요.');
+    }
     if (m === 'GET' && (p === '/' || p === '/index.html')) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       return fs.createReadStream(path.join(__dirname, 'public', 'index.html')).pipe(res);
     }
+    // URL/헤더 1차 검사
+    if (block.guard(req, res)) return;
     const a = auth(req);
 
     if (p === '/api/me' && m === 'GET') {
@@ -101,8 +116,9 @@ http.createServer(async (req, res) => {
       const I = ip(req), f = fails[I] || (fails[I] = { n: 0, t: Date.now() });
       if (Date.now() - f.t > 600e3) { f.n = 0; f.t = Date.now(); }
       if (f.n >= 10) return fail(res, 429, '시도가 너무 많습니다. 10분 뒤에 다시 시도하세요.');
-      const { username, password } = await body(req), name = String(username || '').trim().toLowerCase();
-      if (!/^[a-z0-9_가-힣]{2,20}$/.test(name)) return fail(res, 400, '아이디는 2~20자의 한글·영문·숫자·_ 만 쓸 수 있습니다.');
+      const _b = await readBody(req, res); if (!_b) return;
+      const { username, password } = _b, name = String(username || '').trim().toLowerCase();
+      if (!block.isSafeId(name) || name.length < 2 || name.length > 20) return fail(res, 400, '아이디는 2~20자의 한글·영문·숫자·_ 만 쓸 수 있습니다.');
       if (typeof password !== 'string' || password.length < 6 || password.length > 100) return fail(res, 400, '비밀번호는 6자 이상이어야 합니다.');
       if (p === '/api/register') {
         if (name === 'admin' || name === '관리자' || users[name]) return fail(res, 409, '이미 사용 중인 아이디입니다.');
@@ -131,9 +147,10 @@ http.createServer(async (req, res) => {
       if (a.admin && a.user === 'admin' && isAdminIP(req)) {
         // IP 관리자는 이메일 불필요
       }
-      const { email } = await body(req);
+      const _b = await readBody(req, res); if (!_b) return;
+      const { email } = _b;
       const em = String(email || '').trim().toLowerCase();
-      if (em && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) return fail(res, 400, '올바른 이메일 형식이 아닙니다.');
+      if (em && !block.isSafeEmail(em)) return fail(res, 400, '올바른 이메일 형식이 아닙니다.');
       if (!users[a.user]) return fail(res, 404, '사용자를 찾을 수 없습니다.');
       users[a.user].email = em;
       if (!em) users[a.user].emailVerified = false;
@@ -164,7 +181,8 @@ http.createServer(async (req, res) => {
       });
     }
     if (p === '/api/verify/confirm' && m === 'POST') {
-      const { code } = await body(req);
+      const _b = await readBody(req, res); if (!_b) return;
+      const { code } = _b;
       const u = users[a.user];
       if (!u) return fail(res, 404, '사용자를 찾을 수 없습니다.');
       if (u.emailVerified) return send(res, 200, { ok: true, emailVerified: true });
@@ -182,7 +200,8 @@ http.createServer(async (req, res) => {
       if (m === 'GET') return send(res, 200, a.admin ? { hasKey: !!cfg.apiKey, key: cfg.apiKey || '' } : { hasKey: !!cfg.apiKey });
       if (!a.admin) return fail(res, 403, 'API 키는 관리자만 변경할 수 있습니다.');
       if (m === 'PUT') {
-        const { apiKey } = await body(req);
+        const _b = await readBody(req, res); if (!_b) return;
+        const { apiKey } = _b;
         if (typeof apiKey !== 'string' || !/^\S{20,}$/.test(apiKey.trim())) return fail(res, 400, '올바른 API 키 형식이 아닙니다.');
         cfg.apiKey = apiKey.trim(); wr(F.cfg, cfg); return send(res, 200, { ok: true });
       }
@@ -223,9 +242,10 @@ http.createServer(async (req, res) => {
     }
     if (p === '/api/admin/users' && m === 'PUT') {
       if (!a.admin) return fail(res, 403, '관리자만 접근할 수 있습니다.');
-      const { username, dailyLimit, banned } = await body(req);
+      const _b = await readBody(req, res); if (!_b) return;
+      const { username, dailyLimit, banned } = _b;
       const name = String(username || '').trim().toLowerCase();
-      if (!name || !users[name]) return fail(res, 404, '사용자를 찾을 수 없습니다.');
+      if (!name || !block.isSafeId(name) || !users[name]) return fail(res, 404, '사용자를 찾을 수 없습니다.');
       if (name === ADMIN_USER || users[name].isAdmin) return fail(res, 403, '관리자 계정은 변경할 수 없습니다.');
       if (dailyLimit !== undefined) {
         if (dailyLimit === null || dailyLimit === '') {
@@ -264,7 +284,8 @@ http.createServer(async (req, res) => {
       const file = path.join(ROOMS, a.user + '.json'), d = rd(file, { rev: 0, rooms: [], tomb: {} });
       if (m === 'GET') return url.searchParams.get('rev') === String(d.rev) ? send(res, 200, { rev: d.rev, same: true }) : send(res, 200, { rev: d.rev, rooms: d.rooms });
       if (m === 'PUT') {
-        const { rooms = [], deleted = [] } = await body(req);
+        const _b = await readBody(req, res); if (!_b) return;
+        const { rooms = [], deleted = [] } = _b;
         if (!Array.isArray(rooms) || rooms.length > 300 || !Array.isArray(deleted)) return fail(res, 400, '잘못된 요청입니다.');
         const map = new Map(d.rooms.map(r => [r.id, r]));
         for (const id of deleted) { map.delete(id); d.tomb[id] = Date.now(); }
@@ -284,7 +305,8 @@ http.createServer(async (req, res) => {
       if (u && u.banned) return fail(res, 403, '차단된 계정입니다.');
       const used = usedOf(a, req), lim = limitOf(a), H = n => ({ 'X-Used': String(n), 'X-Limit': String(lim === Infinity ? 0 : lim) });
       if (!a.admin && used >= lim) return fail(res, 429, `오늘 질문 한도(${lim}회)를 모두 사용했습니다. 내일 다시 이용해 주세요.`, H(used));
-      const { model, contents, temperature, noThink } = await body(req);
+      const _b = await readBody(req, res); if (!_b) return;
+      const { model, contents, temperature, noThink } = _b;
       if (!/^[\w.\-]+$/.test(model || '') || !Array.isArray(contents) || !contents.length || contents.length > 60) return fail(res, 400, '잘못된 요청입니다.');
       const gen = { temperature: Math.min(2, Math.max(0, Number(temperature) || 0.7)) };
       if (noThink) gen.thinkingConfig = { thinkingBudget: 0 };
